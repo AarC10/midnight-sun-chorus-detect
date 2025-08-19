@@ -1,3 +1,4 @@
+import os
 import sys
 import numpy as np
 import librosa
@@ -10,7 +11,13 @@ def main():
     input_wav = sys.argv[1]
     output_npy = sys.argv[2]
 
-    print(input_wav, output_npy)
+    if not os.path.isfile(input_wav):
+        print("Input wav file does not exist")
+        sys.exit(1)
+
+    audio_time_series, sampling_rate = librosa.load(input_wav)
+
+
 
 if __name__ == '__main__':
     main()
