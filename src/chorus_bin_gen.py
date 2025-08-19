@@ -23,7 +23,7 @@ def main():
     print(audio_time_series.shape)
     print("Sampling rate: ", sampling_rate)
 
-    np.save(output_npy, chroma)
+    np.save(output_npy, chroma.astype(np.float32))
     print("Saved numpy template to " + output_npy)
 
 if __name__ == '__main__':
