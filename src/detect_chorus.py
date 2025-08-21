@@ -16,7 +16,7 @@ START_THRESHOLD = float(os.getenv("CHORUS_START_THRESHOLD", str(DEFAULT_THRESHOL
 CONT_THRESHOLD = float(os.getenv("CHORUS_CONT_THRESHOLD", str(max(0.0, DEFAULT_THRESHOLD - 0.08))))
 MAX_GAP_SEC = float(os.getenv("CHORUS_MAX_GAP_SEC", "0.25"))  # allow brief dips below cont threshold
 ALIGN_TOL_SEC = float(os.getenv("CHORUS_ALIGN_TOL_SEC", "0.23"))  # tolerate ±sec frame misalignment
-CHORUS_METHOD = os.getenv("CHORUS_METHOD", "hyst").lower()  # 'hyst' or 'dtw'
+CHORUS_METHOD = os.getenv("CHORUS_METHOD", "dtw").lower()  # 'dtw' (default) or 'hyst'
 
 
 def compute_chroma(audio: np.ndarray, sr: int, hop_length: int = 512) -> np.ndarray:
