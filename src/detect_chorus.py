@@ -60,7 +60,7 @@ def compute_similarities(chroma: np.ndarray, chorus_template: np.ndarray) -> np.
 
     out = np.empty(chroma.shape[1] - template_len + 1, dtype=np.float32)
     for i in range(out.size):
-        window = chroma[:, i:i+template_len]
+        window = chroma[:, i:i + template_len]
         win_flat = window.flatten().astype(np.float32)
         win_flat = win_flat - win_flat.mean()
         denom = (np.linalg.norm(win_flat) + 1e-9) * t_norm
@@ -68,7 +68,8 @@ def compute_similarities(chroma: np.ndarray, chorus_template: np.ndarray) -> np.
     return out
 
 
-def find_segments(similarities: np.ndarray, threshold: float, frames_per_sec: float, min_run_sec: float) -> list[tuple[int, int]]:
+def find_segments(similarities: np.ndarray, threshold: float, frames_per_sec: float, min_run_sec: float) -> list[
+    tuple[int, int]]:
     if similarities.size == 0:
         return []
     min_run_frames = max(3, int(min_run_sec * frames_per_sec))
@@ -94,7 +95,7 @@ def find_segments(similarities: np.ndarray, threshold: float, frames_per_sec: fl
 
 def live_detect(chorus_npy):
     hop_length = 512
-    sr = 22050 # default sampl rate
+    sr = 22050  # default sampl rate
     blocksize = hop_length * 20  # ~0.46s per block
     chorus_template = load_template(chorus_npy)
     template_len = chorus_template.shape[1]
@@ -130,7 +131,8 @@ def live_detect(chorus_npy):
 
 
 def print_usage_and_exit():
-    print("Usage:\n  Live:  python3 src/detect_chorus.py <chorus_template.npy>\n  File:  python3 src/detect_chorus.py <input.wav> <chorus_template.npy>")
+    print(
+        "Usage:\n  Live:  python3 src/detect_chorus.py <chorus_template.npy>\n  File:  python3 src/detect_chorus.py <input.wav> <chorus_template.npy>")
     sys.exit(1)
 
 
@@ -185,9 +187,10 @@ def main():
     print("Chorus detected segments (start times in seconds):")
     for start_idx, end_idx in segments:
         t = start_idx * hop_length / sr
-        peak = float(similarities[start_idx:end_idx+1].max())
+        peak = float(similarities[start_idx:end_idx + 1].max())
         dur = (end_idx - start_idx + 1) / frames_per_sec
         print(f"{t:.2f}s (peak={peak:.2f}, dur={dur:.2f}s)")
+
 
 if __name__ == '__main__':
     main()
