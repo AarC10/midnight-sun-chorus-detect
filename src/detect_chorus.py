@@ -7,9 +7,16 @@ import queue
 import time
 
 # Tunables
-DEFAULT_THRESHOLD = float(os.getenv("CHORUS_THRESHOLD", "0.5"))
+DEFAULT_THRESHOLD = float(os.getenv("CHORUS_THRESHOLD", "0.8"))
 MIN_RUN_SEC = float(os.getenv("CHORUS_MIN_RUN_SEC", "1.0"))  # min seconds above threshold to count
-LIVE_COOLDOWN_SEC = float(os.getenv("CHORUS_LIVE_COOLDOWN_SEC", "2.0"))  # debouncer
+LIVE_COOLDOWN_SEC = float(os.getenv("CHORUS_LIVE_COOLDOWN_SEC", "5.0"))  # debouncer
+SMOOTH_SEC = float(os.getenv("CHORUS_SMOOTH_SEC", "0.0"))  # moving average window in seconds; 0 disables
+SEGMENT_SIGNAL = os.getenv("CHORUS_SEGMENT_SIGNAL", "raw").lower()  # "smooth" or "raw"
+START_THRESHOLD = float(os.getenv("CHORUS_START_THRESHOLD", str(DEFAULT_THRESHOLD)))
+CONT_THRESHOLD = float(os.getenv("CHORUS_CONT_THRESHOLD", str(max(0.0, DEFAULT_THRESHOLD - 0.08))))
+MAX_GAP_SEC = float(os.getenv("CHORUS_MAX_GAP_SEC", "0.25"))  # allow brief dips below cont threshold
+ALIGN_TOL_SEC = float(os.getenv("CHORUS_ALIGN_TOL_SEC", "0.23"))  # tolerate ±sec frame misalignment
+CHORUS_METHOD = os.getenv("CHORUS_METHOD", "hyst").lower()  # 'hyst' or 'dtw'
 
 
 def compute_chroma(audio: np.ndarray, sr: int, hop_length: int = 512) -> np.ndarray:
@@ -50,21 +57,66 @@ def update_chroma_buffer(buf: np.ndarray, new_frames: np.ndarray) -> np.ndarray:
     return buf
 
 
-def compute_similarities(chroma: np.ndarray, chorus_template: np.ndarray) -> np.ndarray:
+def compute_similarities(chroma: np.ndarray, chorus_template: np.ndarray, frames_per_sec: float | None = None,
+                         align_tol_sec: float = 0.0) -> np.ndarray:
     template_len = chorus_template.shape[1]
     if chroma.shape[1] < template_len:
         return np.empty(0, dtype=np.float32)
-    temp_flat = chorus_template.flatten().astype(np.float32)
-    temp_flat = temp_flat - temp_flat.mean()
-    t_norm = np.linalg.norm(temp_flat) + 1e-9
+
+    # Precompute centered template
+    t = chorus_template.astype(np.float32)
+    # We'll compare on overlapping parts when shifting, so no single flattened template
 
     out = np.empty(chroma.shape[1] - template_len + 1, dtype=np.float32)
+
+    max_shift_frames = 0
+    if frames_per_sec is not None and align_tol_sec > 0:
+        max_shift_frames = max(1, int(round(frames_per_sec * align_tol_sec)))
+
     for i in range(out.size):
-        window = chroma[:, i:i + template_len]
-        win_flat = window.flatten().astype(np.float32)
-        win_flat = win_flat - win_flat.mean()
-        denom = (np.linalg.norm(win_flat) + 1e-9) * t_norm
-        out[i] = float(np.dot(win_flat, temp_flat) / denom)
+        # Base window
+        w = chroma[:, i:i + template_len].astype(np.float32)
+
+        if max_shift_frames == 0:
+            # No alignment search: straight centered-cosine over full window
+            wf = w.flatten()
+            tf = t.flatten()
+            # center
+            wf = wf - wf.mean()
+            tf = tf - tf.mean()
+            denom = (np.linalg.norm(wf) + 1e-9) * (np.linalg.norm(tf) + 1e-9)
+            out[i] = float(np.dot(wf, tf) / denom)
+            continue
+
+        # Search over shifts in [-K..K] without wrap; compare only overlapping region
+        best = -1.0
+        T = template_len
+        for s in range(-max_shift_frames, max_shift_frames + 1):
+            if s == 0:
+                w_slice = w
+                t_slice = t
+            elif s > 0:
+                # shift template right by s -> compare w[:, s:] with t[:, :T-s]
+                if s >= T:
+                    continue
+                w_slice = w[:, s:]
+                t_slice = t[:, :T - s]
+            else:  # s < 0
+                ss = -s
+                if ss >= T:
+                    continue
+                w_slice = w[:, :T - ss]
+                t_slice = t[:, ss:]
+            wf = w_slice.flatten()
+            tf = t_slice.flatten()
+            # center
+            wf = wf - wf.mean()
+            tf = tf - tf.mean()
+            denom = (np.linalg.norm(wf) + 1e-9) * (np.linalg.norm(tf) + 1e-9)
+            sim = float(np.dot(wf, tf) / denom)
+            if sim > best:
+                best = sim
+        out[i] = best
     return out
 
 
@@ -91,6 +143,86 @@ def find_segments(similarities: np.ndarray, threshold: float, frames_per_sec: fl
     if (prev - run_start + 1) >= min_run_frames:
         segments.append((run_start, prev))
     return segments
+
+
+def find_segments_hysteresis(similarities: np.ndarray, frames_per_sec: float,
+                             start_thresh: float, cont_thresh: float,
+                             min_run_sec: float, max_gap_sec: float) -> list[tuple[int, int]]:
+    if similarities.size == 0:
+        return []
+    min_run_frames = max(1, int(round(min_run_sec * frames_per_sec)))
+    max_gap_frames = max(0, int(round(max_gap_sec * frames_per_sec)))
+
+    segments: list[tuple[int, int]] = []
+    in_run = False
+    run_start = 0
+    gap = 0
+
+    for i, v in enumerate(similarities):
+        if not in_run:
+            if v >= start_thresh:
+                in_run = True
+                run_start = i
+                gap = 0
+        else:
+            if v >= cont_thresh:
+                gap = 0
+            else:
+                gap += 1
+                if gap > max_gap_frames:
+                    run_end = i - gap  # last frame before gap started
+                    if run_end >= run_start and (run_end - run_start + 1) >= min_run_frames:
+                        segments.append((run_start, run_end))
+                    in_run = False
+                    gap = 0
+    # close trailing
+    if in_run:
+        run_end = len(similarities) - 1
+        if (run_end - run_start + 1) >= min_run_frames:
+            segments.append((run_start, run_end))
+    return segments
+
+
+def detect_dtw_segment(chroma_song: np.ndarray, chroma_tmpl: np.ndarray):
+    # librosa expects shape (features, frames)
+    # chroma already matches (12, T)
+    x = chroma_tmpl.astype(np.float32)  # (12, n)
+    y = chroma_song.astype(np.float32)  # (12, m)
+    try:
+        # subsequence alignment: match all of X inside Y
+        d, wp = librosa.sequence.dtw(X=x, Y=y, metric='cosine', subseq=True)
+    except Exception:
+        # Fallback: regular DTW (may force alignment to start)
+        d, wp = librosa.sequence.dtw(X=x, Y=y, metric='cosine', subseq=False)
+    if wp is None or len(wp) == 0:
+        return None
+
+    path = np.array(wp)[::-1]
+    i_idx = path[:, 0]
+    j_idx = path[:, 1]
+    n = int(x.shape[1])
+    y_hits = np.full(n, -1, dtype=int)
+    for i, j in zip(i_idx, j_idx):
+        if 0 <= i < n and y_hits[i] == -1:
+            y_hits[i] = j
+    valid = y_hits[y_hits >= 0]
+    if valid.size == 0:
+        return None
+    start_idx = int(valid.min())
+    end_idx = int(valid.max())
+
+    # Recompute cosine sim of 12D cols along mapped pairs
+    sims = []
+    for i in range(n):
+        j = y_hits[i]
+        if j >= 0:
+            a = x[:, i]
+            b = y[:, j]
+            na = np.linalg.norm(a) + 1e-9
+            nb = np.linalg.norm(b) + 1e-9
+            sims.append(float(np.dot(a, b) / (na * nb)))
+    score = float(np.mean(sims)) if sims else 0.0
+    return start_idx, end_idx, score
 
 
 def live_detect(chorus_npy):
@@ -136,6 +268,15 @@ def print_usage_and_exit():
     sys.exit(1)
 
 
+def smooth_similarities(sim: np.ndarray, frames_per_sec: float, smooth_sec: float) -> np.ndarray:
+    if smooth_sec <= 0 or sim.size == 0:
+        return sim
+    w = max(1, int(round(frames_per_sec * smooth_sec)))
+    if w <= 1:
+        return sim
+    kernel = np.ones(w, dtype=np.float32) / w
+    return np.convolve(sim, kernel, mode='same').astype(np.float32)
+
 def main():
     if len(sys.argv) == 2:
         chorus_npy = sys.argv[1]
@@ -163,31 +304,55 @@ def main():
 
     chorus_template = load_template(chorus_npy)
 
-    similarities = compute_similarities(chroma, chorus_template)
+    frames_per_sec = sr / hop_length
 
-    threshold = DEFAULT_THRESHOLD
-
-    if similarities.size == 0:
-        print("No chorus detected.")
+    if CHORUS_METHOD == 'dtw':
+        res = detect_dtw_segment(chroma, chorus_template)
+        if not res:
+            print("No chorus detected (DTW).")
+            return
+        start_idx, end_idx, score = res
+        start_t = start_idx * hop_length / sr
+        dur = max(0.0, (end_idx - start_idx + 1) / frames_per_sec)
+        print(f"DTW best segment: {start_t:.2f}s (dur={dur:.2f}s, score={score:.2f})")
         return
 
-    best_idx = int(np.argmax(similarities))
-    best_time = best_idx * hop_length / sr
-    print(f"Best match at {best_time:.2f}s (similarity={similarities[best_idx]:.2f})")
+    # Hysteresis/threshold method (default)
+    raw_similarities = compute_similarities(chroma, chorus_template, frames_per_sec, ALIGN_TOL_SEC)
+    similarities = smooth_similarities(raw_similarities, frames_per_sec, SMOOTH_SEC)
 
-    frames_per_sec = sr / hop_length
-    segments = find_segments(similarities, threshold, frames_per_sec, MIN_RUN_SEC)
+    # Select which signal to segment on
+    seg_signal = similarities if SEGMENT_SIGNAL == "smooth" else raw_similarities
+
+    # Report best match from raw
+    if raw_similarities.size == 0:
+        print("No chorus detected.")
+        return
+    best_idx = int(np.argmax(raw_similarities))
+    best_time = best_idx * hop_length / sr
+    best_raw = float(raw_similarities[best_idx])
+    best_smooth = float(similarities[best_idx]) if similarities.size > best_idx else best_raw
+    print(f"Best match at {best_time:.2f}s (raw={best_raw:.2f}, smooth={best_smooth:.2f})")
+
+    # Segment detection using hysteresis
+    segments = find_segments_hysteresis(
+        seg_signal,
+        frames_per_sec,
+        START_THRESHOLD,
+        CONT_THRESHOLD,
+        MIN_RUN_SEC,
+        MAX_GAP_SEC,
+    )
 
     if not segments:
-        if similarities[best_idx] >= threshold:
-            print(f"Chorus detected (peak-only) at ~{best_time:.2f}s (similarity={similarities[best_idx]:.2f})")
-        else:
-            return
+        if best_raw >= START_THRESHOLD:
+            print(f"Chorus detected (peak-only) at ~{best_time:.2f}s (raw={best_raw:.2f})")
+        return
 
     print("Chorus detected segments (start times in seconds):")
     for start_idx, end_idx in segments:
         t = start_idx * hop_length / sr
-        peak = float(similarities[start_idx:end_idx + 1].max())
+        peak = float(seg_signal[start_idx:end_idx + 1].max())
         dur = (end_idx - start_idx + 1) / frames_per_sec
         print(f"{t:.2f}s (peak={peak:.2f}, dur={dur:.2f}s)")
 
