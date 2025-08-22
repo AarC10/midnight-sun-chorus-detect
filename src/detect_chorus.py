@@ -8,10 +8,10 @@ import time
 import serial
 
 # Tunables
-DEFAULT_THRESHOLD = float(os.getenv("CHORUS_THRESHOLD", "0.8"))
+DEFAULT_THRESHOLD = float(os.getenv("CHORUS_THRESHOLD", "0.55")) # default threshold for detection
 MIN_RUN_SEC = float(os.getenv("CHORUS_MIN_RUN_SEC", "1.0"))  # min seconds above threshold to count
 LIVE_COOLDOWN_SEC = float(os.getenv("CHORUS_LIVE_COOLDOWN_SEC", "5.0"))  # debouncer
-SMOOTH_SEC = float(os.getenv("CHORUS_SMOOTH_SEC", "0.0"))  # moving average window in seconds; 0 disables
+SMOOTH_SEC = float(os.getenv("CHORUS_SMOOTH_SEC", "2.0"))  # moving average window in seconds; 0 disables
 SEGMENT_SIGNAL = os.getenv("CHORUS_SEGMENT_SIGNAL", "raw").lower()  # "smooth" or "raw"
 START_THRESHOLD = float(os.getenv("CHORUS_START_THRESHOLD", str(DEFAULT_THRESHOLD)))
 CONT_THRESHOLD = float(os.getenv("CHORUS_CONT_THRESHOLD", str(max(0.0, DEFAULT_THRESHOLD - 0.08))))
