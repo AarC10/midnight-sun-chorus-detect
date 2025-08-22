@@ -17,6 +17,8 @@ CONT_THRESHOLD = float(os.getenv("CHORUS_CONT_THRESHOLD", str(max(0.0, DEFAULT_T
 MAX_GAP_SEC = float(os.getenv("CHORUS_MAX_GAP_SEC", "0.25"))  # allow brief dips below cont threshold
 ALIGN_TOL_SEC = float(os.getenv("CHORUS_ALIGN_TOL_SEC", "0.23"))  # tolerate ±sec frame misalignment
 CHORUS_METHOD = os.getenv("CHORUS_METHOD", "dtw").lower()  # 'dtw' (default) or 'hyst'
+TEMPLATE_SR = int(float(os.getenv("CHORUS_TEMPLATE_SR", "22050")))  # SR used for template and chroma calc
+INPUT_DEVICE = os.getenv("CHORUS_INPUT_DEVICE")  # optional: device index or name
 
 
 def compute_chroma(audio: np.ndarray, sr: int, hop_length: int = 512) -> np.ndarray:
@@ -227,39 +229,166 @@ def detect_dtw_segment(chroma_song: np.ndarray, chroma_tmpl: np.ndarray):
 
 def live_detect(chorus_npy):
     hop_length = 512
-    sr = 22050  # default sampl rate
-    blocksize = hop_length * 20  # ~0.46s per block
+    block_duration_sec = (hop_length * 20) / float(TEMPLATE_SR)
+
     chorus_template = load_template(chorus_npy)
     template_len = chorus_template.shape[1]
     chroma_buffer = np.zeros((12, template_len), dtype=np.float32)
     q_audio = queue.Queue()
     last_detect_time = -1e9
 
+    # Buffer for resampled mono audio at TEMPLATE_SR
+    sample_buffer = np.zeros(0, dtype=np.float32)
+    # need at least this many samples before chroma to avoid n_fft/tuning warnings
+    min_samples = max(4096, hop_length * 8)
+    window_samples = max(min_samples, template_len * hop_length)
+
+    last_report_time = time.time()
+    report_interval_sec = 2.0
+    similarity_history = []
+    audio_level_history = []
+
     def audio_callback(indata, frames, time_info, status):
         q_audio.put(indata.copy())
 
+    # Choose an input sample rate supported by the current input device
+    def pick_input_samplerate() -> int:
+        device = INPUT_DEVICE
+        if device is not None:
+            try:
+                device = int(device)
+            except (ValueError, TypeError):
+                pass
+
+        try:
+            dev = sd.query_devices(None if device is None else device, 'input')
+            sr = int(round(dev.get('default_samplerate') or 0))
+            if sr:
+                try:
+                    sd.check_input_settings(device=device, samplerate=sr, channels=1)
+                    return sr
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        for sr in (48000, 44100, 32000, 24000, 16000):
+            try:
+                sd.check_input_settings(device=device, samplerate=sr, channels=1)
+                return sr
+            except Exception:
+                continue
+        return TEMPLATE_SR
+
+    input_sr = pick_input_samplerate()
+    blocksize = max(256, int(round(block_duration_sec * input_sr)))
+
+    device = INPUT_DEVICE
+    if device is not None:
+        try:
+            device = int(device)
+        except (ValueError, TypeError):
+            pass
+
+    channels = 1
     try:
         stream = sd.InputStream(
-            channels=1, samplerate=sr, blocksize=blocksize, callback=audio_callback
+            device=device,
+            channels=channels,
+            samplerate=input_sr,
+            blocksize=blocksize,
+            callback=audio_callback,
         )
-    except Exception as e:
-        print("Could not open audio input device. Check your microphone and permissions. Error:", e)
-        sys.exit(1)
+    except Exception as e1:
+        try:
+            channels = 2
+            stream = sd.InputStream(
+                device=device,
+                channels=channels,
+                samplerate=input_sr,
+                blocksize=blocksize,
+                callback=audio_callback,
+            )
+        except Exception as e2:
+            print("Could not open audio input device. Check your microphone and permissions.")
+            print(f"Tried device={device!r}, samplerate={input_sr}, channels tried=[1,2]")
+            print("Last errors:", e1, "/", e2)
+            sys.exit(1)
 
-    print("Listening for chorus... Press Ctrl+C to stop.")
+    print(f"Listening for chorus... device={device!r}, mic_sr={input_sr} -> template_sr={TEMPLATE_SR}, channels={channels}. Press Ctrl+C to stop.")
+    print("Audio level meter: [----....] = quiet, [████....] = loud")
+
     with stream:
         try:
             while True:
                 audio_chunk = q_audio.get().flatten()
-                chroma = compute_chroma(audio_chunk, sr, hop_length)
-                chroma_buffer = update_chroma_buffer(chroma_buffer, chroma)
+                if channels == 2:
+                    audio_chunk = audio_chunk.reshape(-1, 2).mean(axis=1)
+
+                # calc audio level for debug
+                audio_level = float(np.sqrt(np.mean(audio_chunk**2))) if audio_chunk.size > 0 else 0.0
+                audio_level_history.append(audio_level)
+
+                if input_sr != TEMPLATE_SR:
+                    try:
+                        audio_chunk = librosa.resample(audio_chunk, orig_sr=input_sr, target_sr=TEMPLATE_SR)
+                    except TypeError:
+                        audio_chunk = librosa.resample(audio_chunk, input_sr, TEMPLATE_SR)
+
+                # append and trim buff
+                if audio_chunk.size:
+                    sample_buffer = np.concatenate((sample_buffer, audio_chunk.astype(np.float32)))
+                    if sample_buffer.size > window_samples:
+                        sample_buffer = sample_buffer[-window_samples:]
+
+                # Only process when enough samples accumulated
+                if sample_buffer.size < min_samples:
+                    continue
+
+                chroma = compute_chroma(sample_buffer, TEMPLATE_SR, hop_length)
+                if chroma.shape[1] == 0:
+                    continue
+
+                # Use only the most recent template_len frames to fill buffer
+                if chroma.shape[1] >= template_len:
+                    chroma_buffer = chroma[:, -template_len:]
+                else:
+                    chroma_buffer = update_chroma_buffer(chroma_buffer, chroma)
+
+                # Compare
                 sim = cosine_sim_centered(chroma_buffer.flatten(), chorus_template.flatten())
+                similarity_history.append(sim)
+
                 now = time.time()
+
+                # Regular similarity and audio level reporting every ~2 seconds
+                if (now - last_report_time) >= report_interval_sec:
+                    avg_level = float(np.mean(audio_level_history)) if audio_level_history else 0.0
+                    max_level = float(np.max(audio_level_history)) if audio_level_history else 0.0
+                    avg_sim = float(np.mean(similarity_history)) if similarity_history else 0.0
+                    max_sim = float(np.max(similarity_history)) if similarity_history else 0.0
+
+                    # level meter
+                    level_bars = int(max_level * 40)  # Scale to 40 chars
+                    level_meter = "█" * min(level_bars, 40) + "." * max(0, 40 - level_bars)
+                    level_meter = f"[{level_meter[:40]}]"
+
+                    print(f"Audio: {level_meter} (avg:{avg_level:.3f} max:{max_level:.3f}) | Similarity: avg={avg_sim:.3f} max={max_sim:.3f}")
+
+                    # Check if we had good similarity over this period
+                    if max_sim > 0.5:  # Lower threshold for reporting interesting matches
+                        print(f"  → Interesting match detected! Peak similarity: {max_sim:.3f}")
+
+                    # Reset tracking
+                    last_report_time = now
+                    similarity_history = []
+                    audio_level_history = []
+
                 if sim > DEFAULT_THRESHOLD and (now - last_detect_time) > LIVE_COOLDOWN_SEC:
-                    print(f"Chorus detected (live) (similarity={sim:.2f})")
+                    print(f"🎵 CHORUS DETECTED! (similarity={sim:.2f}) 🎵")
                     last_detect_time = now
+
         except KeyboardInterrupt:
-            print("Stopped.")
+            print("\nStopped.")
 
 
 def print_usage_and_exit():
@@ -277,7 +406,24 @@ def smooth_similarities(sim: np.ndarray, frames_per_sec: float, smooth_sec: floa
     kernel = np.ones(w, dtype=np.float32) / w
     return np.convolve(sim, kernel, mode='same').astype(np.float32)
 
+def list_input_devices():
+    try:
+        devices = sd.query_devices()
+    except Exception as e:
+        print("Failed to query devices:", e)
+        sys.exit(1)
+    print("Input devices:")
+    for idx, d in enumerate(devices):
+        if d.get('max_input_channels', 0) > 0:
+            name = d.get('name', 'unknown')
+            sr = d.get('default_samplerate', None)
+            print(f"  [{idx}] {name}  (default_sr={sr})")
+
+
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == '--list-devices':
+        list_input_devices()
+        return
     if len(sys.argv) == 2:
         chorus_npy = sys.argv[1]
         if not os.path.isfile(chorus_npy):
