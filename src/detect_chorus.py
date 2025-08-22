@@ -5,6 +5,7 @@ import librosa
 import sounddevice as sd
 import queue
 import time
+import serial
 
 # Tunables
 DEFAULT_THRESHOLD = float(os.getenv("CHORUS_THRESHOLD", "0.8"))
@@ -227,7 +228,7 @@ def detect_dtw_segment(chroma_song: np.ndarray, chroma_tmpl: np.ndarray):
     return start_idx, end_idx, score
 
 
-def live_detect(chorus_npy):
+def live_detect(chorus_npy, uart_port=None):
     hop_length = 512
     # Keep block duration similar to ~0.46s at template SR
     block_duration_sec = (hop_length * 20) / float(TEMPLATE_SR)
@@ -242,6 +243,16 @@ def live_detect(chorus_npy):
     chroma_buffer = np.zeros((12, sliding_window_frames), dtype=np.float32)
     q_audio = queue.Queue()
     last_detect_time = -1e9
+
+    # Initialize UART connection if specified
+    uart_connection = None
+    if uart_port:
+        try:
+            uart_connection = serial.Serial(uart_port, baudrate=921600, timeout=1)
+            print(f"UART initialized on {uart_port} at 921600 baud")
+        except Exception as e:
+            print(f"Failed to initialize UART on {uart_port}: {e}")
+            uart_connection = None
 
     # Buffer for resampled mono audio at TEMPLATE_SR
     sample_buffer = np.zeros(0, dtype=np.float32)
@@ -402,16 +413,28 @@ def live_detect(chorus_npy):
                 # Main detect using best similarity
                 if best_sim > DEFAULT_THRESHOLD and (now - last_detect_time) > LIVE_COOLDOWN_SEC:
                     print(f"DETECTED! (similarity={best_sim:.2f})")
+                    if uart_connection:
+                        try:
+                            uart_connection.write(b"bright 7000\n")
+                            uart_connection.flush()
+                            print("UART command sent: bright 7000")
+                        except Exception as e:
+                            print(f"Failed to send UART command: {e}")
 
                     last_detect_time = now
 
         except KeyboardInterrupt:
             print("\nStopped.")
+        finally:
+            if uart_connection:
+                uart_connection.close()
+                print("UART connection closed.")
 
 
 def print_usage_and_exit():
     print(
-        "Usage:\n  Live:  python3 src/detect_chorus.py <chorus_template.npy>\n  File:  python3 src/detect_chorus.py <input.wav> <chorus_template.npy>")
+        "Usage:\n  Live:  python3 src/detect_chorus.py <chorus_template.npy> [UART_PORT]\n  File:  python3 src/detect_chorus.py <input.wav> <chorus_template.npy>")
+    print("  UART_PORT: Optional serial port (e.g., /dev/ttyUSB0) for sending 'bright 7000' command on detection")
     sys.exit(1)
 
 
@@ -442,13 +465,19 @@ def main():
     if len(sys.argv) >= 2 and sys.argv[1] == '--list-devices':
         list_input_devices()
         return
-    if len(sys.argv) == 2:
-        chorus_npy = sys.argv[1]
-        if not os.path.isfile(chorus_npy):
-            print("Chorus template npy file does not exist")
-            sys.exit(1)
-        live_detect(chorus_npy)
-        return
+
+    # live detection mode
+    if len(sys.argv) == 2 or len(sys.argv) == 3:
+        if sys.argv[1].endswith('.npy'):
+            chorus_npy = sys.argv[1]
+            uart_port = sys.argv[2] if len(sys.argv) == 3 else None
+
+            if not os.path.isfile(chorus_npy):
+                print("Chorus template npy file does not exist")
+                sys.exit(1)
+            live_detect(chorus_npy, uart_port)
+            return
+
     if len(sys.argv) < 3:
         print_usage_and_exit()
 
