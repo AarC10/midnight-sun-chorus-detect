@@ -229,22 +229,30 @@ def detect_dtw_segment(chroma_song: np.ndarray, chroma_tmpl: np.ndarray):
 
 def live_detect(chorus_npy):
     hop_length = 512
+    # Keep block duration similar to ~0.46s at template SR
     block_duration_sec = (hop_length * 20) / float(TEMPLATE_SR)
 
     chorus_template = load_template(chorus_npy)
     template_len = chorus_template.shape[1]
-    chroma_buffer = np.zeros((12, template_len), dtype=np.float32)
+
+    # Use smaller sliding window for partial matching (e.g., 4-6 seconds)
+    sliding_window_sec = 4.0  # Match any 4-second chunk
+    sliding_window_frames = max(20, int(sliding_window_sec * TEMPLATE_SR / hop_length))
+
+    chroma_buffer = np.zeros((12, sliding_window_frames), dtype=np.float32)
     q_audio = queue.Queue()
     last_detect_time = -1e9
 
     # Buffer for resampled mono audio at TEMPLATE_SR
     sample_buffer = np.zeros(0, dtype=np.float32)
-    # need at least this many samples before chroma to avoid n_fft/tuning warnings
+    # Need at least this many samples before chroma to avoid n_fft/tuning warnings
     min_samples = max(4096, hop_length * 8)
-    window_samples = max(min_samples, template_len * hop_length)
+    # Process up to this window (match template footprint in samples)
+    window_samples = max(min_samples, sliding_window_frames * hop_length)
 
+    # Add tracking for regular similarity reporting
     last_report_time = time.time()
-    report_interval_sec = 2.0
+    report_interval_sec = 2.0  # Report every 2 seconds
     similarity_history = []
     audio_level_history = []
 
@@ -315,7 +323,8 @@ def live_detect(chorus_npy):
             sys.exit(1)
 
     print(f"Listening for chorus... device={device!r}, mic_sr={input_sr} -> template_sr={TEMPLATE_SR}, channels={channels}. Press Ctrl+C to stop.")
-    print("Audio level meter: [----....] = quiet, [████....] = loud")
+    print(f"Audio level meter: [----....] = quiet, [████....] = loud")
+    print(f"Sliding window: {sliding_window_sec}s chunks vs {template_len * hop_length / TEMPLATE_SR:.1f}s template")
 
     with stream:
         try:
@@ -348,15 +357,23 @@ def live_detect(chorus_npy):
                 if chroma.shape[1] == 0:
                     continue
 
-                # Use only the most recent template_len frames to fill buffer
-                if chroma.shape[1] >= template_len:
-                    chroma_buffer = chroma[:, -template_len:]
+                # sliding window instead of full template length
+                if chroma.shape[1] >= sliding_window_frames:
+                    chroma_buffer = chroma[:, -sliding_window_frames:]
                 else:
                     chroma_buffer = update_chroma_buffer(chroma_buffer, chroma)
 
-                # Compare
-                sim = cosine_sim_centered(chroma_buffer.flatten(), chorus_template.flatten())
-                similarity_history.append(sim)
+                # Compare sliding window against ALL parts of the template
+                best_sim = -1.0
+                if chroma_buffer.shape[1] == sliding_window_frames:
+                    # Compare this window against every possible position in the template
+                    for start_pos in range(0, template_len - sliding_window_frames + 1, 5):
+                        template_chunk = chorus_template[:, start_pos:start_pos + sliding_window_frames]
+                        sim = cosine_sim_centered(chroma_buffer.flatten(), template_chunk.flatten())
+                        if sim > best_sim:
+                            best_sim = sim
+
+                similarity_history.append(best_sim)
 
                 now = time.time()
 
@@ -367,7 +384,6 @@ def live_detect(chorus_npy):
                     avg_sim = float(np.mean(similarity_history)) if similarity_history else 0.0
                     max_sim = float(np.max(similarity_history)) if similarity_history else 0.0
 
-                    # level meter
                     level_bars = int(max_level * 40)  # Scale to 40 chars
                     level_meter = "█" * min(level_bars, 40) + "." * max(0, 40 - level_bars)
                     level_meter = f"[{level_meter[:40]}]"
@@ -376,15 +392,17 @@ def live_detect(chorus_npy):
 
                     # Check if we had good similarity over this period
                     if max_sim > 0.5:  # Lower threshold for reporting interesting matches
-                        print(f"  → Interesting match detected! Peak similarity: {max_sim:.3f}")
+                        print(f"  → Potential match detected. Peak similarity: {max_sim:.3f}")
 
-                    # Reset tracking
+                    # Reset
                     last_report_time = now
                     similarity_history = []
                     audio_level_history = []
 
-                if sim > DEFAULT_THRESHOLD and (now - last_detect_time) > LIVE_COOLDOWN_SEC:
-                    print(f"🎵 CHORUS DETECTED! (similarity={sim:.2f}) 🎵")
+                # Main detect using best similarity
+                if best_sim > DEFAULT_THRESHOLD and (now - last_detect_time) > LIVE_COOLDOWN_SEC:
+                    print(f"DETECTED! (similarity={best_sim:.2f})")
+
                     last_detect_time = now
 
         except KeyboardInterrupt:
